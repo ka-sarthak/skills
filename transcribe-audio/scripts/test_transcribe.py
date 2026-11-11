@@ -19,10 +19,11 @@ sys.modules[SPEC.name] = module
 SPEC.loader.exec_module(module)
 
 
-def segment(text, start=0.0):
+def segment(text, start=0.0, end=None):
+    end = start + 0.8 if end is None else end
     return SimpleNamespace(
-        start=start, end=start + 0.8, text=text,
-        words=[SimpleNamespace(start=start, end=start + 0.8, word=text)],
+        start=start, end=end, text=text,
+        words=[SimpleNamespace(start=start, end=end, word=text)],
     )
 
 
@@ -89,6 +90,50 @@ class TranscriptionTests(unittest.TestCase):
         self.assertEqual(status, 1)
         self.assertEqual(self.output.read_bytes(), before)
         self.assertEqual(backend.WhisperModel.call_count, 1)
+
+    def test_participant_words_are_merged_before_forming_turns(self):
+        for index, (bob_start, bob_end, alice_offset, bob_offset, starts) in enumerate([
+            (0.9, 1.5, 0, 0, ["00:00:00", "00:00:00", "00:00:01"]),
+            (0, 0.6, 2, 3, ["00:00:02", "00:00:03", "00:00:03"]),
+            (0.4, 1.2, 0, 0, ["00:00:00", "00:00:00", "00:00:01"]),
+        ]):
+            with self.subTest(bob_start=bob_start, offsets=(alice_offset, bob_offset)):
+                alice = segment("First. Second.", end=2.4)
+                alice.words = [
+                    segment("First.", end=0.8).words[0],
+                    segment(" Second.", 1.6, 2.4).words[0],
+                ]
+                backend, decoder, _ = self.runtime([
+                    [alice], [segment("Reply.", bob_start, bob_end)],
+                ])
+                output = self.root / f"interleaved-{index}.md"
+                status, out, err = self.run_main([
+                    "--input", str(self.a), "--speaker", "Alice", "--offset", str(alice_offset),
+                    "--input", str(self.b), "--speaker", "Bob", "--offset", str(bob_offset),
+                    "--output", str(output),
+                ], backend, decoder)
+                self.assertEqual((status, err), (0, ""))
+                rows = [line for line in output.read_text().splitlines() if line.startswith("**[")]
+                self.assertEqual([line.split("] ", 1)[1] for line in rows], [
+                    "Alice:** First.", "Bob:** Reply.", "Alice:** Second.",
+                ])
+                for row, start in zip(rows, starts):
+                    self.assertTrue(row.startswith(f"**[{start}–"))
+                summary = json.loads(out.splitlines()[-1])
+                self.assertEqual((summary["turns"], summary["alignment_units"]), (3, 3))
+
+    def test_english_is_default_and_explicit_languages_are_preserved(self):
+        for index, (extras, expected) in enumerate([
+            ([], "en"), (["--language", "auto"], None), (["--language", "de"], "de"),
+        ]):
+            with self.subTest(language=expected):
+                backend, decoder, pipeline = self.runtime()
+                status, _, err = self.run_main([
+                    "--input", str(self.a), "--single-speaker",
+                    "--output", str(self.root / f"language-{index}.md"), *extras,
+                ], backend, decoder)
+                self.assertEqual((status, err), (0, ""))
+                self.assertEqual(pipeline.transcribe.call_args.kwargs["language"], expected)
 
     def test_mixed_recording_with_confirmed_label_mapping(self):
         backend, decoder, _ = self.runtime()
@@ -161,6 +206,42 @@ class TranscriptionTests(unittest.TestCase):
         turns = module.make_turns(words)
         self.assertEqual([t.text for t in turns], ["One two.", "Three.", "Four."])
 
+    def test_aligned_pieces_preserve_original_spacing(self):
+        for pieces in [
+            ["Open", "AI", "'s", " demo."],
+            ["We", "'re", " ready", ",", " Alice", "."],
+            ["  Hello ", "world.  "],
+            ["Hello", " ", "world."],
+            ["你", "好"],
+        ]:
+            with self.subTest(pieces=pieces):
+                data = segment("".join(pieces))
+                data.words = [
+                    SimpleNamespace(start=i / 10, end=(i + 1) / 10, word=text)
+                    for i, text in enumerate(pieces)
+                ]
+                turns = module.make_turns(module.segment_words(data, "Alice", 0))
+                self.assertEqual([turn.text for turn in turns], [data.text.strip()])
+                self.assertIn(f"Alice:** {data.text.strip()}", module.render(turns, 1, "supplied"))
+
+    def test_fallback_boundaries_get_only_needed_separators(self):
+        for first_fallback, second_fallback, first_text, second_text, expected in [
+            (True, True, "First.", "Second.", "First. Second."),
+            (True, False, "First.", "Second.", "First. Second."),
+            (False, True, "First.", "Second.", "First. Second."),
+            (True, True, "Hello", ", world.", "Hello, world."),
+            (False, True, "Hello ", "world.", "Hello world."),
+            (True, False, "Hello", " world.", "Hello world."),
+        ]:
+            with self.subTest(fallbacks=(first_fallback, second_fallback), expected=expected):
+                first, second = segment(first_text), segment(second_text, 0.8)
+                if first_fallback:
+                    first.words = []
+                if second_fallback:
+                    second.words = []
+                words = module.segment_words(first, "Alice", 0) + module.segment_words(second, "Alice", 0)
+                self.assertEqual([turn.text for turn in module.make_turns(words)], [expected])
+
     def test_mixed_overlap_and_uncovered_words_are_not_guessed(self):
         intervals = [(0, 2, "SPEAKER_00"), (1, 3, "SPEAKER_01")]
         self.assertEqual(module.speaker_for_word(0, 0.5, intervals, {"SPEAKER_00": "Alice"}), "Alice")
@@ -193,13 +274,16 @@ class TranscriptionTests(unittest.TestCase):
             self.assertEqual(os.environ["PYANNOTE_METRICS_ENABLED"], "0")
 
     def test_no_speech_is_reported_without_inventing_content(self):
-        backend, decoder, _ = self.runtime([[]])
-        status, out, err = self.run_main([
-            "--input", str(self.a), "--single-speaker", "--output", str(self.output),
-        ], backend, decoder)
-        self.assertEqual((status, err), (0, ""))
-        self.assertFalse(json.loads(out.splitlines()[-1])["speech_detected"])
-        self.assertIn("No intelligible speech", self.output.read_text())
+        for index, rows in enumerate([[], [segment("   ")]]):
+            with self.subTest(rows=rows):
+                backend, decoder, _ = self.runtime([rows])
+                output = self.root / f"empty-{index}.md"
+                status, out, err = self.run_main([
+                    "--input", str(self.a), "--single-speaker", "--output", str(output),
+                ], backend, decoder)
+                self.assertEqual((status, err), (0, ""))
+                self.assertFalse(json.loads(out.splitlines()[-1])["speech_detected"])
+                self.assertIn("No intelligible speech", output.read_text())
 
 
 if __name__ == "__main__":

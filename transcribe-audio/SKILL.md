@@ -5,7 +5,7 @@ description: Transcribe local audio with offline Whisper models and create conci
 
 # Transcribe Audio
 
-Produce a timestamped transcript and concise meeting notes. Prefer separate participant tracks when available; accept a single mixed recording using local speaker diarization.
+Produce a timestamped transcript and concise meeting notes, defaulting to English recordings. Prefer separate participant tracks when available; accept a single mixed recording using local speaker diarization.
 
 ## Confirm the task and privacy boundary
 
@@ -62,7 +62,7 @@ Use one `--offset` in seconds per input if tracks start at different times. Offs
 
 Keep anonymous labels until the user supplies a mapping. A name list alone does not identify voices. Apply a confirmed mapping with `--speaker-map "/local/labels.json"`, containing a JSON object such as `{"SPEAKER_00": "Alice"}`. If local diarization is unavailable, ask about obtaining it, supplying separate tracks, or accepting an explicitly unattributed transcript using `--unattributed`.
 
-Use `--help` for model, language, batch size, device, and offset options. Auto-detect the language unless the user supplies it. Transcribe in the original language unless translation is requested.
+Use `--help` for model, language, batch size, device, and offset options. Default to English (`--language en`); use another `--language` code when requested, or `--language auto` for detection. Transcribe in the original language unless translation is requested.
 
 ## Write the meeting notes
 

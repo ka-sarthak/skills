@@ -42,6 +42,7 @@ class Utterance:
     end: float
     text: str
     speaker: str
+    segment_fallback: bool = False
 
 
 def parser():
@@ -57,7 +58,7 @@ def parser():
     result.add_argument("--speaker-map", type=Path, help="Confirmed raw diarization label to name JSON.")
     result.add_argument("--num-speakers", type=int)
     result.add_argument("--model", default="turbo", help="Cached faster-whisper alias or local model directory.")
-    result.add_argument("--language", default="auto")
+    result.add_argument("--language", default="en", help="Language code (default: en); use auto to detect.")
     result.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
     result.add_argument("--compute-type", help="Defaults to int8 on CPU, float16 on CUDA.")
     result.add_argument("--threads", type=int, default=min(8, os.cpu_count() or 1))
@@ -143,7 +144,10 @@ def segment_words(segment, speaker, offset):
     words = list(segment.words or [])
     aligned = "".join(word.word for word in words)
     if not words or re.sub(r"\s+", "", aligned) != re.sub(r"\s+", "", segment.text):
-        return [Utterance(segment.start + offset, segment.end + offset, segment.text.strip(), speaker)]
+        return [Utterance(
+            segment.start + offset, segment.end + offset, segment.text.strip(), speaker,
+            segment_fallback=True,
+        )]
     return [
         Utterance(word.start + offset, word.end + offset, word.word, speaker)
         for word in words
@@ -193,10 +197,11 @@ def load_mapping(path):
 
 
 def make_turns(words):
-    """Join nearby words from one track; keep gaps and speaker changes."""
+    """Join chronologically merged words; keep gaps, speaker changes, and aligned spacing."""
     turns = []
+    previous = None
     for word in words:
-        if not word.text.strip():
+        if not word.text:
             continue
         if not all(math.isfinite(v) for v in (word.start, word.end)) or word.start < 0 or word.end < word.start:
             raise UserError("Invalid word timestamps; no transcript was written.")
@@ -205,12 +210,22 @@ def make_turns(words):
             and 0 <= word.start - turns[-1].end <= 1.5
             and word.end - turns[-1].start <= 35
         ):
-            # Whisper words retain leading whitespace; segment fallbacks may not.
-            separator = "" if word.text[:1].isspace() or word.text[:1] in ".,!?;:" else " "
+            # Aligned pieces supply their own spacing; fallbacks may need a separator.
+            separator = ""
+            if (
+                (previous.segment_fallback or word.segment_fallback)
+                and not turns[-1].text[-1:].isspace()
+                and not word.text[:1].isspace() and word.text[:1] not in ".,!?;:"
+            ):
+                separator = " "
             turns[-1].text += separator + word.text
             turns[-1].end = max(turns[-1].end, word.end)
         else:
-            turns.append(Utterance(word.start, word.end, word.text.strip(), word.speaker))
+            turns.append(Utterance(word.start, word.end, word.text, word.speaker))
+        previous = word
+    for turn in turns:
+        turn.text = turn.text.strip()
+    turns = [turn for turn in turns if turn.text]
     original = re.sub(r"\s+", "", "".join(word.text for word in words))
     merged = re.sub(r"\s+", "", "".join(turn.text for turn in turns))
     if original != merged:
@@ -270,10 +285,9 @@ def transcribe(args, tracks, output):
         cpu_threads=args.threads, local_files_only=True,
     )
     started = time.monotonic()
-    turns = []
+    words = []
     duration = 0.0
     speech_seconds = 0.0
-    token_count = 0
     for index, track in enumerate(tracks, 1):
         audio = decode_audio(str(track.path))
         intervals = diarize(audio, args) if args.diarization_model else []
@@ -289,7 +303,6 @@ def transcribe(args, tracks, output):
         )
         duration = max(duration, track.offset + info.duration)
         speech_seconds += info.duration_after_vad
-        words = []
         last_report = time.monotonic()
         for segment in segments:
             current = segment_words(segment, track.speaker, track.offset)
@@ -302,9 +315,9 @@ def transcribe(args, tracks, output):
             if time.monotonic() - last_report >= 20:
                 print(json.dumps({"track": index, "processed_seconds": round(segment.end, 1)}), flush=True)
                 last_report = time.monotonic()
-        token_count += len(words)
-        turns.extend(make_turns(words))
         print(json.dumps({"track": index, "complete": True, "duration_seconds": round(info.duration, 1)}), flush=True)
+    words.sort(key=lambda word: (word.start, word.end, word.speaker))
+    turns = make_turns(words)
     attribution = (
         "local diarization; uncertain attribution is marked." if args.diarization_model
         else "unattributed; speaker identities were not inferred." if args.unattributed
@@ -313,7 +326,7 @@ def transcribe(args, tracks, output):
     write_private(output, render(turns, duration, attribution))
     return {
         "output": str(output), "tracks": len(tracks), "turns": len(turns),
-        "alignment_units": token_count, "speech_seconds": round(speech_seconds, 1),
+        "alignment_units": len(words), "speech_seconds": round(speech_seconds, 1),
         "duration_seconds": round(duration, 1), "elapsed_seconds": round(time.monotonic() - started, 1),
         "speech_detected": bool(turns),
     }
