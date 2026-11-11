@@ -1,0 +1,4 @@
+interface:
+  display_name: "Local Audio Transcription"
+  short_description: "Transcribe local audio and write private meeting notes"
+  default_prompt: "Use $transcribe-audio to transcribe local recordings and create concise meeting notes after confirming privacy choices and output paths."
